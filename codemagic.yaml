@@ -1,0 +1,80 @@
+# Codemagic CI — signed build of this fork for KaiC's own TestFlight.
+#
+# Upstream's source is built untouched; everything that makes it "ours" (bundle id, no
+# iCloud) is applied here at build time, so `git merge upstream/main` never conflicts.
+# The unsigned compile check is upstream's .github/workflows/nightly.yml, which runs on
+# every push for free. Codemagic's 500 free macOS minutes a month are only spent on
+# signing.
+
+workflows:
+  testflight:
+    name: Device build to TestFlight
+    max_build_duration: 45
+    instance_type: mac_mini_m2
+    # No push trigger: it never fired reliably on the other apps, and a manual start
+    # (scripts/codemagic.py start main) avoids paying for duplicate builds.
+    integrations:
+      # Same team-level App Store Connect key as DailyStore, NextStop and Backdrop.
+      app_store_connect: NextStop ASC key
+    environment:
+      xcode: latest
+      # Supplies CERT_KEY_B64: the private key of the distribution certificate, base64.
+      groups:
+        - code_signing
+      vars:
+        BUNDLE_ID: com.kaichuan.aidoku
+    scripts:
+      - name: Make the project ours
+        script: |
+          set -e
+          # The xcconfig derives app.aidoku.Aidoku, which belongs to upstream's team.
+          # An explicit target setting wins over the xcconfig, and use-profiles reads
+          # it without having to resolve xcconfig variables.
+          sed -i '' "s/PRODUCT_NAME = Aidoku;/PRODUCT_NAME = Aidoku; PRODUCT_BUNDLE_IDENTIFIER = $BUNDLE_ID;/" \
+            Aidoku.xcodeproj/project.pbxproj
+          grep -c "PRODUCT_BUNDLE_IDENTIFIER = $BUNDLE_ID;" Aidoku.xcodeproj/project.pbxproj | grep -qx 2
+
+          # iCloud and push need a container registered by hand in the developer portal
+          # (the API cannot), and user-fonts is unused. iCloud sync is an off-by-default
+          # experimental toggle that greys itself out when the container is missing.
+          plist=Aidoku/Aidoku.entitlements
+          for key in aps-environment \
+                     com.apple.developer.icloud-container-identifiers \
+                     com.apple.developer.icloud-services \
+                     com.apple.developer.ubiquity-container-identifiers \
+                     com.apple.developer.ubiquity-kvstore-identifier \
+                     com.apple.developer.user-fonts; do
+            /usr/libexec/PlistBuddy -c "Delete :$key" "$plist" || true
+          done
+          cat "$plist"
+      - name: Create signing files
+        script: |
+          set -e
+          keychain initialize
+          # Carried base64 because a PEM pasted into a web form loses its line breaks.
+          printf '%s' "$CERT_KEY_B64" | openssl base64 -d -A > "$HOME/cert_key.pem"
+          # --create registers the bundle id and a profile if they do not exist yet.
+          app-store-connect fetch-signing-files "$BUNDLE_ID" \
+            --type IOS_APP_STORE --create \
+            --certificate-key "@file:$HOME/cert_key.pem"
+          keychain add-certificates
+      - name: Apply signing settings
+        script: |
+          xcode-project use-profiles \
+            --project Aidoku.xcodeproj \
+            --code-signing-setup-verbose-logging
+      - name: Build IPA
+        script: |
+          xcode-project build-ipa \
+            --project Aidoku.xcodeproj \
+            --scheme Aidoku \
+            --archive-flags="-destination 'generic/platform=iOS' -skipPackagePluginValidation -skipMacroValidation" \
+            --archive-xcargs "COMPILER_INDEX_STORE_ENABLE=NO CURRENT_PROJECT_VERSION=$BUILD_NUMBER"
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+    publishing:
+      app_store_connect:
+        auth: integration
+        # Internal testers get the build the moment processing finishes.
+        submit_to_testflight: false
