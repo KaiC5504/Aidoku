@@ -144,7 +144,13 @@ def cmd_watch() -> int:
         return 0
     build_id, seen = build["_id"], None
     while True:
-        build = call(f"/builds/{build_id}").get("build", build)
+        # Codemagic's API drops the odd connection mid-build; one miss shouldn't end the watch.
+        try:
+            build = call(f"/builds/{build_id}").get("build", build)
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as error:
+            print(f"  (poll failed: {error}; retrying)")
+            time.sleep(20)
+            continue
         status = build.get("status")
         if status != seen:
             print(f"  {status}")
